@@ -1,0 +1,257 @@
+/*
+ * tx2_gpio.c - NVIDIA Jetson TX2 开发板 GPIO 控制示例（sysfs）
+ *
+ * 适用：JetPack 4.x / L4T 32.x（kernel 4.9），TX2 / TX2i 开发板。
+ *       该版本内核通常没有 libgpiod，故使用经典 /sys/class/gpio 接口。
+ *
+ * 编译：make
+ * 用法（需要 root 或 gpio 组权限）：
+ *   sudo ./tx2_gpio J21:7 out 1      # J21 第 7 脚输出高电平
+ *   sudo ./tx2_gpio 396 out 0        # 直接用 sysfs GPIO 编号
+ *   sudo ./tx2_gpio J21:13 in        # 读取输入电平
+ *   sudo ./tx2_gpio J21:7 blink 500  # 每 500ms 翻转，Ctrl+C 退出
+ *
+ * 说明：
+ *   - J21:7 这类写法会查 tx2_gpio_map.h 里的引脚表；也可直接给 396 这样的编号。
+ *   - 自定义 GPIO 可用 Tegra 名称换算：sysfs = 320 + port*8 + pin（main），
+ *     AON 控制器基址为 256。port 编号查 tegra186-gpio.h，
+ *     或用 `sudo dmesg | grep "registered GPIO"` 确认基址。
+ *   - 若引脚被 pinmux 占用为 SFIO，需要先修改 pinmux 配置。
+ *   - sysfs 翻转速度有限（约数百 Hz），高频需求请用寄存器或 PWM。
+ */
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "tx2_gpio_map.h"
+
+#define GPIO_BASE "/sys/class/gpio"
+
+static volatile sig_atomic_t keep_running = 1;
+static int exported_gpio = -1;
+
+static void on_sigint(int signo)
+{
+	(void)signo;
+	keep_running = 0;
+}
+
+static void usage(const char *prog)
+{
+	fprintf(stderr,
+		"Usage:\n"
+		"  %s <J21:7|396> out [0|1]\n"
+		"  %s <J21:7|396> in\n"
+		"  %s <J21:7|396> blink [period_ms]\n",
+		prog, prog, prog);
+}
+
+static int write_file(const char *path, const char *str)
+{
+	int fd = open(path, O_WRONLY);
+	ssize_t n;
+
+	if (fd < 0)
+		return -1;
+	n = write(fd, str, strlen(str));
+	close(fd);
+	return n == (ssize_t)strlen(str) ? 0 : -1;
+}
+
+static int write_int_file(const char *path, int val)
+{
+	char buf[32];
+
+	snprintf(buf, sizeof(buf), "%d", val);
+	return write_file(path, buf);
+}
+
+static int read_int_file(const char *path)
+{
+	int fd = open(path, O_RDONLY);
+	char buf[32];
+	ssize_t n;
+
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	buf[n] = '\0';
+	return atoi(buf);
+}
+
+static void gpio_path(char *buf, size_t size, int gpio, const char *what)
+{
+	snprintf(buf, size, GPIO_BASE "/gpio%d/%s", gpio, what);
+}
+
+static int gpio_export(int gpio)
+{
+	char dir[64];
+	char path[64];
+	struct timespec ts = { 0, 20000000 };
+	int saved_errno;
+	int i;
+
+	gpio_path(dir, sizeof(dir), gpio, "");
+	if (access(dir, F_OK) == 0)
+		return 0;
+
+	if (write_int_file(GPIO_BASE "/export", gpio) < 0) {
+		saved_errno = errno;
+		if (saved_errno == EBUSY && access(dir, F_OK) == 0)
+			return 0;
+		errno = saved_errno;
+		return -1;
+	}
+
+	for (i = 0; i < 20; i++) {
+		if (access(dir, F_OK) == 0)
+			return 0;
+		nanosleep(&ts, NULL);
+	}
+	snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d", gpio);
+	fprintf(stderr, "timeout waiting for %s\n", path);
+	return -1;
+}
+
+static void gpio_unexport(int gpio)
+{
+	write_int_file(GPIO_BASE "/unexport", gpio);
+}
+
+static int parse_spec(const char *str, int *gpio)
+{
+	char *end;
+	unsigned long v;
+	int pin;
+
+	if (!strncasecmp(str, "J21:", 4)) {
+		pin = atoi(str + 4);
+		*gpio = tx2_j21_lookup(pin);
+		if (*gpio < 0)
+			fprintf(stderr, "J21 pin %d has no GPIO\n", pin);
+		return *gpio < 0 ? -1 : 0;
+	}
+
+	v = strtoul(str, &end, 0);
+	if (*end != '\0' || v > 1023) {
+		fprintf(stderr, "invalid GPIO spec: %s\n", str);
+		return -1;
+	}
+	*gpio = (int)v;
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	const char *mode;
+	char path[80];
+	int gpio = -1;
+	int want = 0, period_ms = 500;
+	int ret = 1;
+
+	if (argc < 3) {
+		usage(argv[0]);
+		return 1;
+	}
+	if (parse_spec(argv[1], &gpio) != 0) {
+		usage(argv[0]);
+		return 1;
+	}
+	mode = argv[2];
+
+	if (!strcmp(mode, "out")) {
+		if (argc >= 4) {
+			if (!strcmp(argv[3], "0"))
+				want = 0;
+			else if (!strcmp(argv[3], "1"))
+				want = 1;
+			else {
+				fprintf(stderr, "value must be 0 or 1\n");
+				return 1;
+			}
+		}
+	} else if (!strcmp(mode, "blink")) {
+		if (argc >= 4) {
+			period_ms = atoi(argv[3]);
+			if (period_ms <= 0) {
+				fprintf(stderr, "invalid period\n");
+				return 1;
+			}
+		}
+		signal(SIGINT, on_sigint);
+	} else if (!strcmp(mode, "in")) {
+		if (argc != 3) {
+			usage(argv[0]);
+			return 1;
+		}
+	} else {
+		usage(argv[0]);
+		return 1;
+	}
+
+	if (gpio_export(gpio) < 0) {
+		fprintf(stderr, "export gpio%d failed: %s\n", gpio, strerror(errno));
+		return 1;
+	}
+	exported_gpio = gpio;
+
+	gpio_path(path, sizeof(path), gpio, "direction");
+	if (write_file(path, !strcmp(mode, "in") ? "in" : "out") < 0) {
+		fprintf(stderr, "set direction failed: %s\n", strerror(errno));
+		goto cleanup;
+	}
+
+	if (!strcmp(mode, "in")) {
+		gpio_path(path, sizeof(path), gpio, "value");
+		ret = read_int_file(path);
+		if (ret < 0) {
+			fprintf(stderr, "read value failed: %s\n", strerror(errno));
+			ret = 1;
+		} else {
+			printf("gpio%d = %d\n", gpio, ret);
+			ret = 0;
+		}
+	} else if (!strcmp(mode, "out")) {
+		gpio_path(path, sizeof(path), gpio, "value");
+		if (write_file(path, want ? "1" : "0") < 0) {
+			fprintf(stderr, "write value failed: %s\n", strerror(errno));
+			ret = 1;
+		} else {
+			printf("gpio%d = %d\n", gpio, want);
+			ret = 0;
+		}
+	} else {
+		int val = 0;
+
+		gpio_path(path, sizeof(path), gpio, "value");
+		printf("gpio%d blinking, period=%dms, press Ctrl+C to stop\n",
+		       gpio, period_ms);
+		while (keep_running) {
+			val ^= 1;
+			if (write_file(path, val ? "1" : "0") < 0) {
+				fprintf(stderr, "write value failed: %s\n", strerror(errno));
+				ret = 1;
+				break;
+			}
+			usleep((useconds_t)period_ms * 1000);
+		}
+		write_file(path, "0");
+		ret = 0;
+	}
+
+cleanup:
+	if (exported_gpio >= 0)
+		gpio_unexport(exported_gpio);
+	return ret;
+}
